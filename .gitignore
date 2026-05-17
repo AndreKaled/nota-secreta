@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+logs/
+logs_tournament/
+*.log
+*.gguf
+.env
+.DS_Store
