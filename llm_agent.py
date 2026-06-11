@@ -7,6 +7,7 @@ import asyncio
 import logging
 from typing import Any, Dict, List
 from collections import Counter
+import math
 
 from base_agent import BaseAgent, STOPWORDS
 from fasta2a import A2AApp, tool
@@ -18,6 +19,25 @@ app = A2AApp(name="LLMAgent")
 
 
 class LLMAgent(BaseAgent):
+    """
+    Agente híbrido baseado em LLM + heurísticas.
+    Estratégia:
+    1. Escolha da carta:
+       - LLM escolhe a música mais ambígua na mão (propositalmente eu julguei ser a melhor estratégia).
+       - fallback baseado em similaridade média da mão.
+
+    2. Geração de dica:
+       - LLM produz dica metafórica.
+       - filtros removem cópia literal de título e letra.
+       - fallback gera dica automaticamente.
+
+    3. Seleção de carta isca:
+       - LLM tenta escolher a melhor correspondência.
+       - fallback usa score heurístico.
+
+    4. Votação:
+       - ranking heurístico baseado em similaridade.
+    """
     # HIPERPARÂMETROS DA LLM
     TEMP_NARRADOR = 0.3
     TEMP_MELOMANO = 0.1
@@ -48,7 +68,7 @@ class LLMAgent(BaseAgent):
         "- nao copie trechos da letra\n"
         "- nao use palavras do titulo\n"
         "- seja indireto\n"
-        "- seja metafórico\n"
+        "- seja metaforico\n"
         "- máximo 6 palavras\n"
         "- evite temas genéricos como amor, vida, felicidade, tristeza\n\n"
         "Letra: {short_lyrics}"
@@ -59,12 +79,6 @@ class LLMAgent(BaseAgent):
         "Selecione a 'Carta Isca' com maior similaridade tematica com a dica.\n"
         "Dica: \"{clue}\"\nSuas cartas: {hand_json}\n\n"
         "Responda no formato: {{\"chosen_id\": <id>}}"
-    )
-    PROMPT_VOTE = (
-        SYSTEM_INSTRUCTION +
-        "Selecione os índices das DUAS musicas candidatas com maior probabilidade de serem a carta do Narrador.\n"
-        "Dica: \"{clue}\"\nCandidatas: {candidates_json}\n\n"
-        "Responda no formato: {{\"votos\": [<id1>, <id2>]}}"
     )
 
     def __init__(self, name: str, llm_url: str):
@@ -107,19 +121,8 @@ class LLMAgent(BaseAgent):
             # fallback
             if not self.hand:
                 return {"chosen_card": {}}
-            # --------------------------------------------------------------
-            # Passo 5: Heurística de Fallback Determinística
-            # --------------------------------------------------------------
-            lengths = [len(song.get("lyrics", "")) for song in self.hand]
-            ordered = sorted(lengths)
-            median = ordered[len(ordered) // 2]
 
-            best_idx = min(
-                range(len(self.hand)),
-                key=lambda i: abs(lengths[i] - median)
-            )
-
-            chosen_card = self.hand[best_idx]
+            chosen_card = max(self.hand,key=self._ambiguity_score)
             logger.warning(f"[choose_card] Fallback acionado. Carta escolhida: {chosen_card['id']}")
 
         logger.info(f"[choose_card] Carta escolhida: {chosen_card['title']} ({chosen_card['id']})")
@@ -196,7 +199,7 @@ class LLMAgent(BaseAgent):
                 "cidade": "caos urbano", "rio": "aguas correntes",
                 "festa": "alegria contagiante", "samba": "ritmo brasileiro",
                 "medo": "sensacao fria", "paz": "calma serena",
-                "flor": "belez natural", "coracao": "sentimento puro",
+                "flor": "beleza natural", "coracao": "sentimento puro",
             }
             clue = synonyms.get(first, "")
             if not clue:
@@ -386,21 +389,6 @@ class LLMAgent(BaseAgent):
             for song in hand
         ]
     
-    def _compact_candidates(self,options: List[Dict[str, Any]],excluded_idx: int) -> List[Dict[str, Any]]:
-        candidates = []
-        for i, opt in enumerate(options):
-            if i == excluded_idx:
-                continue
-
-            candidates.append({
-                "indice_original": i,
-                "titulo": opt.get("title", ""),
-                "trecho": " ".join(
-                    opt.get("lyrics", "").split()[:30]
-                ),
-            })
-        return candidates
-    
     def _get_song_by_id(self, song_id: int) -> Dict[str, Any] | None:
         for song in self.hand:
             if song["id"] == song_id:
@@ -461,14 +449,100 @@ class LLMAgent(BaseAgent):
 
         return lyrics
 
-    def _candidate_score(self,clue: str,song: Dict[str, Any]) -> int:
-        score = 0
-        score += (self._similarity_score(clue,song.get("title", "")) * 4)
-        score += (self._similarity_score(clue,song.get("artist", "")))
+    def _candidate_score(self,clue: str,song: Dict[str, Any]) -> float:
+        score = 0.0
+
+        title = song.get("title","")
+        artist = song.get("artist", "")
         refrao = self._extract_refrao(song.get("lyrics", ""))
         trecho = " ".join(refrao.split()[:25])
-        score += (self._similarity_score(clue,trecho) * 2)
+
+        # heuristica antiga
+        score += self._similarity_score(clue, title) * 4
+        score += self._similarity_score(clue, artist)
+        score += self._similarity_score(clue, trecho) * 2
+
+        # similaridade vetorial
+        score += self._vector_similarity(clue, title) * 20
+        score += self._vector_similarity(clue, artist) * 5
+        score += self._vector_similarity(clue, trecho) * 40
+
         return score
+
+    def _text_to_vector(self, text: str) -> Counter:
+        """
+        Converte texto em um vetor de palavras + trigramas.
+        """
+        words = re.findall(r"\w+", text.lower())
+        features = []
+        for word in words:
+            if word in STOPWORDS:
+                continue
+            features.append(word)
+
+            if len(word) >= 3:
+                for i in range(len(word) - 2):
+                    features.append(word[i:i + 3])
+
+        return Counter(features)
+
+    def _calculate_cosine(self, vec1: Counter, vec2: Counter) -> float:
+        """
+        Similaridade por cosseno.
+        """
+        intersection = set(vec1) & set(vec2)
+        dot_product = sum(
+            vec1[k] * vec2[k]
+            for k in intersection
+        )
+        magnitude1 = math.sqrt(
+            sum(v * v for v in vec1.values())
+        )
+        magnitude2 = math.sqrt(
+            sum(v * v for v in vec2.values())
+        )
+        if magnitude1 == 0 or magnitude2 == 0:
+            return 0.0
+
+        return dot_product / (magnitude1 * magnitude2)
+
+    def _vector_similarity(self, clue: str, text: str) -> float:
+        clue_vec = self._text_to_vector(clue)
+        text_vec = self._text_to_vector(text)
+        return self._calculate_cosine(
+            clue_vec,
+            text_vec,
+        )
+
+    def _ambiguity_score(self, song: Dict[str, Any]) -> float:
+        """
+        Mede o quanto a música está semanticamente
+        próxima das demais cartas da mão.
+        """
+
+        refrao = self._extract_refrao(song.get("lyrics", ""))
+        trecho = " ".join(refrao.split()[:25])
+        similarities = []
+        for other in self.hand:
+            if other["id"] == song["id"]:
+                continue
+            other_refrao = self._extract_refrao(
+                other.get("lyrics", "")
+            )
+            other_trecho = " ".join(
+                other_refrao.split()[:25]
+            )
+            similarities.append(
+                self._vector_similarity(
+                    trecho,
+                    other_trecho
+                )
+            )
+        if not similarities:
+            return 0.0
+        
+        similarities.sort()
+        return similarities[len(similarities) // 2]
 
 def main() -> None:
     parser = argparse.ArgumentParser()
